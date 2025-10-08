@@ -82,7 +82,7 @@ use {
         sanitized::{MessageHash, SanitizedTransaction, MAX_TX_ACCOUNT_LOCKS},
         versioned::VersionedTransaction,
     },
-    solana_transaction_context::transaction_accounts::TransactionAccount,
+    solana_transaction_context::transaction_accounts::KeyedAccountSharedData,
     solana_transaction_error::TransactionError,
     solana_transaction_status::{
         map_inner_instructions, BlockEncodingOptions, ConfirmedBlock,
@@ -310,7 +310,7 @@ impl JsonRpcRequestProcessor {
         program_id: &Pubkey,
         filters: Vec<RpcFilterType>,
         sort_results: bool,
-    ) -> ScanResult<Vec<TransactionAccount>> {
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let scan_order = if sort_results {
             ScanOrder::Sorted
         } else {
@@ -2411,15 +2411,6 @@ pub(crate) fn optimize_filters(filters: &mut [RpcFilterType]) {
     })
 }
 
-fn verify_transaction(transaction: &SanitizedTransaction) -> Result<()> {
-    #[allow(clippy::question_mark)]
-    if transaction.verify().is_err() {
-        return Err(RpcCustomError::TransactionSignatureVerificationFailure.into());
-    }
-
-    Ok(())
-}
-
 pub(crate) fn verify_filters(filters: &[RpcFilterType]) -> Result<()> {
     if filters.len() > MAX_GET_PROGRAM_ACCOUNT_FILTERS {
         return Err(Error::invalid_params(format!(
@@ -3838,6 +3829,9 @@ pub mod rpc_full {
                 unsanitized_tx,
                 preflight_bank,
                 preflight_bank.get_reserved_account_keys(),
+                preflight_bank
+                    .feature_set
+                    .is_active(&agave_feature_set::static_instruction_limit::id()),
             )?;
             let blockhash = *transaction.message().recent_blockhash();
             let message_hash = *transaction.message_hash();
@@ -3859,9 +3853,9 @@ pub mod rpc_full {
             }
 
             if !skip_preflight {
-                verify_transaction(&transaction)?;
+                let verification_error = transaction.verify().err();
 
-                if !meta.config.skip_preflight_health_check {
+                if verification_error.is_none() && !meta.config.skip_preflight_health_check {
                     match meta.health.check() {
                         RpcHealthStatus::Ok => (),
                         RpcHealthStatus::Unknown => {
@@ -3881,6 +3875,12 @@ pub mod rpc_full {
                     }
                 }
 
+                let simulation_result = if let Some(err) = verification_error {
+                    TransactionSimulationResult::new_error(err)
+                } else {
+                    preflight_bank.simulate_transaction(&transaction, false)
+                };
+
                 if let TransactionSimulationResult {
                     result: Err(err),
                     logs,
@@ -3894,7 +3894,7 @@ pub mod rpc_full {
                     post_balances: _,
                     pre_token_balances: _,
                     post_token_balances: _,
-                } = preflight_bank.simulate_transaction(&transaction, false)
+                } = simulation_result
                 {
                     match err {
                         TransactionError::BlockhashNotFound => {
@@ -3988,11 +3988,25 @@ pub mod rpc_full {
                 });
             }
 
-            let transaction =
-                sanitize_transaction(unsanitized_tx, bank, bank.get_reserved_account_keys())?;
-            if sig_verify {
-                verify_transaction(&transaction)?;
-            }
+            let transaction = sanitize_transaction(
+                unsanitized_tx,
+                bank,
+                bank.get_reserved_account_keys(),
+                bank.feature_set
+                    .is_active(&agave_feature_set::static_instruction_limit::id()),
+            )?;
+
+            let verification_error = if sig_verify {
+                transaction.verify().err()
+            } else {
+                None
+            };
+
+            let simulation_result = if let Some(err) = verification_error {
+                TransactionSimulationResult::new_error(err)
+            } else {
+                bank.simulate_transaction(&transaction, enable_cpi_recording)
+            };
 
             let TransactionSimulationResult {
                 result,
@@ -4007,7 +4021,7 @@ pub mod rpc_full {
                 post_balances,
                 pre_token_balances,
                 post_token_balances,
-            } = bank.simulate_transaction(&transaction, enable_cpi_recording);
+            } = simulation_result;
 
             let account_keys = transaction.message().account_keys();
             let number_of_accounts = account_keys.len();
@@ -4391,6 +4405,7 @@ fn sanitize_transaction(
     transaction: VersionedTransaction,
     address_loader: impl AddressLoader,
     reserved_account_keys: &HashSet<Pubkey>,
+    enable_static_instruction_limit: bool,
 ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
     RuntimeTransaction::try_create(
         transaction,
@@ -4398,6 +4413,7 @@ fn sanitize_transaction(
         None,
         address_loader,
         reserved_account_keys,
+        enable_static_instruction_limit,
     )
     .map_err(|err| Error::invalid_params(format!("invalid transaction: {err}")))
 }
@@ -6099,12 +6115,27 @@ pub mod tests {
         );
         let res = io.handle_request_sync(&req, meta.clone());
         let expected = json!({
-            "jsonrpc":"2.0",
-            "error": {
-                "code": -32003,
-                "message": "Transaction signature verification failure"
+            "jsonrpc": "2.0",
+            "result": {
+                "context": { "slot": 0, "apiVersion": RpcApiVersion::default() },
+                "value": {
+                    "accounts": null,
+                    "err": "SignatureFailure",
+                    "innerInstructions": null,
+                    "loadedAccountsDataSize": 0,
+                    "fee": null,
+                    "loadedAddresses": { "readonly": [], "writable": [] },
+                    "preBalances": null,
+                    "postBalances": null,
+                    "preTokenBalances": null,
+                    "postTokenBalances": null,
+                    "logs": [],
+                    "replacementBlockhash": null,
+                    "returnData": null,
+                    "unitsConsumed": 0,
+                }
             },
-            "id":1
+            "id": 1,
         });
 
         let expected: Response =
@@ -6931,7 +6962,7 @@ pub mod tests {
                 r#"{"jsonrpc":"2.0","error":{"code":-32005,"message":"Node is behind by 42 slots","data":{"numSlotsBehind":42}},"id":1}"#.to_string(),
             )
         );
-        health.stub_set_health_status(None);
+        health.stub_set_health_status(Some(RpcHealthStatus::Ok));
 
         // sendTransaction will fail due to invalid signature
         bad_transaction.signatures[0] = Signature::default();
@@ -6941,12 +6972,36 @@ pub mod tests {
             bs58::encode(serialize(&bad_transaction).unwrap()).into_string()
         );
         let res = io.handle_request_sync(&req, meta.clone());
-        assert_eq!(
-            res,
-            Some(
-                r#"{"jsonrpc":"2.0","error":{"code":-32003,"message":"Transaction signature verification failure"},"id":1}"#.to_string(),
-            )
-        );
+        let expected = json!({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32002,
+                "data": {
+                    "accounts": null,
+                    "err": "SignatureFailure",
+                    "innerInstructions": null,
+                    "loadedAccountsDataSize": 0,
+                    "fee": null,
+                    "loadedAddresses": null,
+                    "preBalances": null,
+                    "postBalances": null,
+                    "preTokenBalances": null,
+                    "postTokenBalances": null,
+                    "logs": [],
+                    "replacementBlockhash": null,
+                    "returnData": null,
+                    "unitsConsumed": 0,
+                },
+                "message": "Transaction simulation failed: Transaction did not pass signature verification",
+            },
+            "id": 1,
+        });
+
+        let expected: Response =
+            serde_json::from_value(expected).expect("expected response deserialization");
+        let result: Response = serde_json::from_str(&res.expect("actual response"))
+            .expect("actual response deserialization");
+        assert_eq!(result, expected);
 
         // sendTransaction will now succeed because skipPreflight=true even though it's a bad
         // transaction
@@ -9097,7 +9152,8 @@ pub mod tests {
             sanitize_transaction(
                 unsanitary_versioned_tx,
                 SimpleAddressLoader::Disabled,
-                &ReservedAccountKeys::empty_key_set()
+                &ReservedAccountKeys::empty_key_set(),
+                true,
             )
             .unwrap_err(),
             expect58
@@ -9122,7 +9178,8 @@ pub mod tests {
             sanitize_transaction(
                 versioned_tx,
                 SimpleAddressLoader::Disabled,
-                &ReservedAccountKeys::empty_key_set()
+                &ReservedAccountKeys::empty_key_set(),
+                true,
             )
             .unwrap_err(),
             Error::invalid_params(

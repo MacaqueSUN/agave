@@ -179,16 +179,14 @@ mod test {
     fn test_file_vote_history_storage() {
         solana_logger::setup();
         let tmp_dir = TempDir::new().unwrap();
-        let tmp_dir_path = tmp_dir.path().to_path_buf();
-        let storage = FileVoteHistoryStorage::new(tmp_dir_path.clone());
-
+        let storage = FileVoteHistoryStorage::new(tmp_dir.path().to_path_buf());
         let keypair = Keypair::new();
         let pubkey = keypair.pubkey();
         assert_eq!(
             storage.filename(&pubkey),
             PathBuf::from(format!(
                 "{}/vote_history-{}.bin",
-                tmp_dir_path.display(),
+                tmp_dir.path().display(),
                 pubkey
             ))
         );
